@@ -1,0 +1,1367 @@
+---
+title: "DGE between responders in IP"
+output:
+  html_document:
+---
+
+```{r setup, include = F}
+library(Seurat)
+library(BPCells)
+library(SeuratDisk)
+library(SeuratData)
+library(dplyr)
+library(cowplot)
+library(patchwork)
+library(stringr)
+library(ggplot2)
+library(formattable)
+library(gridExtra)
+library(grid)
+library(RColorBrewer)
+library(gridExtra)
+library(grid)
+library(gridExtra)
+#library(Azimuth)
+library(stringr)
+library(Polychrome)
+options(scipen=999)
+library(celldex)
+library(scRNAseq)
+#library(SingleR)
+library(SingleCellExperiment)
+library(scRepertoire)
+library(ggraph)
+library(data.table)
+library(ggpubr)
+library(magrittr)
+library(tidyverse)
+library(DESeq2)
+library(openxlsx)
+library(msigdbr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(GSVA)
+library(ComplexHeatmap)
+library(pals)
+library(ggrepel)
+library(ggfortify)
+library(survminer)
+library(survival)
+library(ranger)
+library(DT)
+options(future.globals.maxSize = 3e+09)
+options(Seurat.object.assay.version = "v5")
+
+set.seed(1)
+
+load("v5_sampIntegrated_cca_5kfeat_pc50_Sscale_G2Mscale_rmDubStrict_0203.Rdata")
+
+ssgsea_markers = as.list(fread("/share/lab_freeman/MM_CAR_2022/data/ssgsea_markers.txt"))
+for(i in 1:length(ssgsea_markers)){ssgsea_markers[[i]] = ssgsea_markers[[i]][which(ssgsea_markers[[i]] != "" )]}
+for(i in 1:length(ssgsea_markers)){ssgsea_markers[[i]] = data.frame(gs_name = names(ssgsea_markers[i]), gene = ssgsea_markers[[i]]) }
+tmp = data.frame()
+for(i in 1:length(ssgsea_markers)){tmp = rbind(tmp, ssgsea_markers[[i]])}
+tmp$gene = gsub("MT.", "MT-", tmp$gene)
+ssgsea_markers = tmp
+```
+
+```{r volc plot func, include = F}
+makeVolcPlot = function(res, cellType)
+{
+	df = res
+	df$Regulation = NA
+	df$Regulation[df$log2FoldChange > 0.5 & df$padj < 0.05] = "Up in DR"
+	df$Regulation[df$log2FoldChange < -0.5 & df$padj < 0.05] = "Up in NDR"
+
+	df$label = NA
+	df$label[!is.na(df$Regulation)] = as.character(df$gene[!is.na(df$Regulation)])
+
+	print(ggplot(df, aes(x = log2FoldChange, y = -log10(padj), label = label, color = Regulation)) + geom_point() + scale_color_manual(values = c("Up in DR" = "blue", "Up in NDR" = "red")) + 
+		theme_classic() + geom_text_repel(segment.curvature = -0.1, segment.ncp = 3, min.segment.length=0.1) + xlab(cellType))
+
+}
+
+makeVolcPlotSc = function(res, cellType)
+{
+	df = res
+	df$Regulation = NA
+	df$Regulation[df$avg_log2FC > 0.5 & df$p_val_adj < 0.05] = "Up in DR"
+	df$Regulation[df$avg_log2FC < -0.5 & df$p_val_adj < 0.05] = "Up in NDR"
+
+	df$label = NA
+	df$label[!is.na(df$Regulation)] = as.character(df$gene[!is.na(df$Regulation)])
+
+	print(ggplot(df, aes(x = avg_log2FC, y = -log10(p_val_adj), label = label, color = Regulation)) + geom_point() + scale_color_manual(values = c("Up in DR" = "blue", "Up in NDR" = "red")) + 
+		theme_classic() + geom_text_repel(segment.curvature = -0.1, segment.ncp = 3, min.segment.length=0.1) + xlab(cellType))
+
+}
+
+gsea_sample_H = function(res)
+{
+	gseaDf = data.frame()
+
+	m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>%
+		  dplyr::select(gs_name, entrez_gene)
+	gene.converter = bitr(res$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+	df = res
+
+	df <- df %>%
+	  left_join(gene.converter, by=c("gene"="SYMBOL")) %>%
+	  dplyr::filter(!is.na(ENTREZID)) %>%
+	  dplyr::arrange(desc(avg_log2FC))
+
+	geneList.gsea <- as.numeric(df[,"avg_log2FC"])
+	names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+	mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+
+	gseaDf <- mygsea@result %>%
+		  mutate(Sig = -1*log10(qvalue)) %>%
+		  arrange(NES)
+
+	gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+	  dplyr::select(ID, NES, p.adjust) %>%
+	  mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+	gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+	gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+	gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+	gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+	gsea_results_df_sum$significance = "significance"
+
+	return(gsea_results_df_sum)
+}
+
+gsea_sample_kegg = function(res)
+{
+	gseaDf = data.frame()
+
+        m_t2g <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>%
+                  dplyr::select(gs_name, entrez_gene)
+        gene.converter = bitr(res$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+	df = res
+
+	df <- df %>%
+	  left_join(gene.converter, by=c("gene"="SYMBOL")) %>%
+	  dplyr::filter(!is.na(ENTREZID)) %>%
+	  dplyr::arrange(desc(avg_log2FC))
+
+	geneList.gsea <- as.numeric(df[,"avg_log2FC"])
+	names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+	mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+
+	gseaDf <- mygsea@result %>%
+		  mutate(Sig = -1*log10(qvalue)) %>%
+		  arrange(NES)
+
+	gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+	  dplyr::select(ID, NES, p.adjust) %>%
+	  mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+	gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+	gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+	gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+	gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+	gsea_results_df_sum$significance = "significance"
+
+	return(gsea_results_df_sum)
+}
+
+gsea_sample_cust = function(res, ssgsea_markers)
+{
+	gseaDf = data.frame()
+	gene.converter = bitr(ssgsea_markers$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+        colnames(gene.converter)[1] = "gene"
+        ssgsea_markers = merge(ssgsea_markers, gene.converter, by = "gene")
+        m_t2g = as_tibble(data.frame(gs_name = ssgsea_markers$gs_name, entrez_gene = as.integer(ssgsea_markers$ENTREZID)))
+
+        df = res
+
+        df <- df %>%
+          left_join(gene.converter, by=c("gene"="gene")) %>%
+          dplyr::filter(!is.na(ENTREZID)) %>%
+          dplyr::arrange(desc(avg_log2FC))
+
+        geneList.gsea <- as.numeric(df[,"avg_log2FC"])
+        names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+        mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+
+        gseaDf <- mygsea@result %>%
+                  mutate(Sig = -1*log10(qvalue)) %>%
+                  arrange(NES)
+
+        gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+          dplyr::select(ID, NES, p.adjust) %>%
+          mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+        gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+        gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+        gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+        gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+        gsea_results_df_sum$significance = "significance"
+
+        return(gsea_results_df_sum)
+}
+
+gsea_cell_H = function(resList, meta)
+{
+        gseaDf = data.frame()
+
+        for(i in 1:length(resList))
+        {
+                cell_type = names(resList)[i]
+                df = resList[[i]]
+                m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>%
+                          dplyr::select(gs_name, entrez_gene)
+                gene.converter = bitr(df$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+
+                df <- df %>%
+                  left_join(gene.converter, by=c("gene"="SYMBOL")) %>%
+                  dplyr::filter(!is.na(ENTREZID)) %>%
+                  dplyr::arrange(desc(avg_log2FC))
+
+                geneList.gsea <- as.numeric(df[,"avg_log2FC"])
+                names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+
+                mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+                if(nrow(mygsea) > 0)
+                {
+                        GSEA.result.df <- mygsea@result %>%
+                          mutate(Sig = -1*log10(qvalue)) %>%
+                          arrange(NES)
+
+                        GSEA.result.df$cell_type = cell_type
+                        gseaDf = rbind(gseaDf, GSEA.result.df)
+                }
+        }
+
+        gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+          dplyr::select(ID, NES, p.adjust, cell_type) %>%
+          mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+        gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+        gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+        gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+        gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+        gsea_results_df_sum = merge(gsea_results_df_sum, meta, by = "cell_type")
+        gsea_results_df_sum$cell_type = paste0(gsea_results_df_sum$cell_type, " (", gsea_results_df_sum$nCell, ")")
+        gsea_results_df_sum$cell_type = factor(gsea_results_df_sum$cell_type, levels = unique(gsea_results_df_sum$cell_type))
+
+        return(gsea_results_df_sum)
+}
+
+gsea_cell_kegg = function(resList, meta)
+{
+        gseaDf = data.frame()
+
+        for(i in 1:length(resList))
+        {
+                cell_type = names(resList)[i]
+                df = resList[[i]]
+                m_t2g <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>%
+                          dplyr::select(gs_name, entrez_gene)
+                gene.converter = bitr(df$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+
+                df <- df %>%
+                  left_join(gene.converter, by=c("gene"="SYMBOL")) %>%
+                  dplyr::filter(!is.na(ENTREZID)) %>%
+                  dplyr::arrange(desc(avg_log2FC))
+
+                geneList.gsea <- as.numeric(df[,"avg_log2FC"])
+                names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+
+                mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+                if(nrow(mygsea) > 0)
+                {
+                        GSEA.result.df <- mygsea@result %>%
+                          mutate(Sig = -1*log10(qvalue)) %>%
+                          arrange(NES)
+
+                        GSEA.result.df$cell_type = cell_type
+                        gseaDf = rbind(gseaDf, GSEA.result.df)
+                }
+        }
+
+        gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+          dplyr::select(ID, NES, p.adjust, cell_type) %>%
+          mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+        gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+        gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+        gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+        gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+        gsea_results_df_sum = merge(gsea_results_df_sum, meta, by = "cell_type")
+        gsea_results_df_sum$cell_type = paste0(gsea_results_df_sum$cell_type, " (", gsea_results_df_sum$nCell, ")")
+        gsea_results_df_sum$cell_type = factor(gsea_results_df_sum$cell_type, levels = unique(gsea_results_df_sum$cell_type))
+        return(gsea_results_df_sum)
+
+}
+
+gsea_cell_cust = function(resList, ssgsea_markers, meta)
+{
+        gseaDf = data.frame()
+
+        gene.converter = bitr(ssgsea_markers$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+        colnames(gene.converter)[1] = "gene"
+        ssgsea_markers = merge(ssgsea_markers, gene.converter, by = "gene")
+        m_t2g = as_tibble(data.frame(gs_name = ssgsea_markers$gs_name, entrez_gene = as.integer(ssgsea_markers$ENTREZID)))
+
+        for(i in 1:length(resList))
+        {
+                df = resList[[i]]
+                cell_type = names(resList)[i]
+                df <- df %>%
+                  left_join(gene.converter, by=c("gene"="gene")) %>%
+                  dplyr::filter(!is.na(ENTREZID)) %>%
+                  dplyr::arrange(desc(avg_log2FC))
+
+                geneList.gsea <- as.numeric(df[,"avg_log2FC"])
+                names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+                mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+
+                if(nrow(mygsea) > 0)
+                {
+                        GSEA.result.df <- mygsea@result %>%
+                                  mutate(Sig = -1*log10(qvalue)) %>%
+                                  arrange(NES)
+                        GSEA.result.df$cell_type = cell_type
+                        gseaDf = rbind(gseaDf, GSEA.result.df)
+                }
+        }
+
+        gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+          dplyr::select(ID, NES, p.adjust, cell_type) %>%
+          mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+        gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+        gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+        gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+        gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+        gsea_results_df_sum = merge(gsea_results_df_sum, meta, by = "cell_type")
+        gsea_results_df_sum$cell_type = paste0(gsea_results_df_sum$cell_type, " (", gsea_results_df_sum$nCell, ")")
+        gsea_results_df_sum$cell_type = factor(gsea_results_df_sum$cell_type, levels = unique(gsea_results_df_sum$cell_type))
+        return(gsea_results_df_sum)
+}
+
+dotplot_cont_samp = function(df, pathTitle)
+{
+        print(ggplot(df, aes(x = significance, y=ID, size = p.adjust_str)) +
+          geom_point(aes(color = NES)) +
+          scale_color_gradientn(colors =  c("red", "white", "blue"), breaks = c(min(df$NES), max(df$NES)),
+                                labels = c(paste0("Up in NDR", "\n", round(min(df$NES) ,3)), paste0("Up in DR", "\n", round(max(df$NES) ,3)))) +
+          theme_classic() + scale_size_manual(values = c(3,2,1,0.5)) + theme(axis.text.x = element_text(angle = 45, hjust=1)) + ylab(paste0(pathTitle, " Pathway")) +
+          theme(axis.text.y = element_text(size = 6)) + xlab(NULL) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.title.x = element_blank()) +
+          guides(size = guide_legend(title = "Significance")) + ggtitle(paste0(pathTitle, " Pathways")))
+}
+
+dotplot_fixed_samp = function(df, pathTitle)
+{
+        print(ggplot(df, aes(x = significance, y=ID, size = p.adjust_str)) +
+          geom_point(aes(color = Regulation)) +
+          scale_color_manual(values =  c("Up in DR" = "blue", "Up in NDR" = "red")) + theme_classic() +
+          scale_size_manual(values = c(3,2,1,0.5)) + theme(axis.text.x = element_text(angle = 45, hjust=1)) + ylab(paste0(pathTitle, " Pathway")) +
+          theme(axis.text.y = element_text(size = 6)) + xlab(NULL) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.title.x = element_blank()) +
+          guides(size = guide_legend(title = "Significance")) + ggtitle(paste0(pathTitle, " Pathways")))
+
+}
+
+dotplot_cont_cell = function(df, pathTitle)
+{
+        print(ggplot(df, aes(x = cell_type, y=ID, size = p.adjust_str)) +
+          geom_point(aes(color = NES)) +
+          scale_color_gradientn(colors =  c("red", "white", "blue"), breaks = c(min(df$NES), max(df$NES)),
+                                labels = c(paste0("Up in NDR", "\n", round(min(df$NES) ,3)), paste0("Up in DR", "\n", round(max(df$NES) ,3)))) +
+          theme_classic() + scale_size_manual(values = c(3,2,1,0.5)) + theme(axis.text.x = element_text(angle = 45, hjust=1)) + ylab(paste0(pathTitle, " Pathway")) +
+          theme(axis.text.y = element_text(size = 6)) + xlab(NULL)  +
+          guides(size = guide_legend(title = "Significance")) + ggtitle(paste0(pathTitle, " Pathways")))
+}
+
+dotplot_fixed_cell = function(df, pathTitle)
+{
+        print(ggplot(df, aes(x = cell_type, y=ID, size = p.adjust_str)) +
+          geom_point(aes(color = Regulation)) +
+          scale_color_manual(values =  c("Up in NDR" = "blue", "Up in DR" = "red")) + theme_classic() +
+          scale_size_manual(values = c(3,2,1,0.5)) + theme(axis.text.x = element_text(angle = 45, hjust=1)) + ylab(paste0(pathTitle, " Pathway")) +
+          theme(axis.text.y = element_text(size = 6)) + xlab(NULL) +
+          guides(size = guide_legend(title = "Significance")) + ggtitle(paste0(pathTitle, " Pathways")))
+
+}
+```
+
+# Results {.tabset}
+
+## All cells {.tabset}
+
+### single cell {.tabset}
+
+#### sample level
+```{r, include = F}
+Idents(allSampsFilt) = "remission9m"
+allSampsIP = subset(allSampsFilt, subset = type == "IP" & remission9m != "insufficientFU")
+
+meta = allSampsIP@meta.data
+metaMaj = meta %>% group_by(major_type) %>% mutate(nCell = n())
+metaMaj = as.data.frame(unique(metaMaj[c("major_type", "nCell")]))
+colnames(metaMaj)[1] = "cell_type"
+
+metaSub = meta %>% group_by(subtype) %>% mutate(nCell = n())
+metaSub = as.data.frame(unique(metaSub[c("subtype", "nCell")]))
+colnames(metaSub)[1] = "cell_type"
+
+res = FindMarkers(allSampsIP, ident.1 = "DR", ident.2 = "NDR", logfc.threshold = 0, min.pct = 0.1)
+res$gene = rownames(res)
+
+gsea_results_df_sum_H = gsea_sample_H(res)
+gsea_results_df_sum_kegg = gsea_sample_kegg(res)
+gsea_results_df_sum_cust = gsea_sample_cust(res, ssgsea_markers)
+#mat = as.matrix(gsea_results_df_sum$NES)
+#colnames(mat) = "NES"
+#rownames(mat) = rownames(gsea_results_df_sum)
+```
+
+```{r, echo = F, fig.height = 12, fig.width = 8}
+dotplot_cont_samp(gsea_results_df_sum_H, "Hallmark")
+dotplot_cont_samp(gsea_results_df_sum_kegg, "Kegg")
+
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) > 1)
+{
+        dotplot_cont_samp(gsea_results_df_sum_cust, "ssgsea")
+}
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) == 1)
+{
+        dotplot_fixed_samp(gsea_results_df_sum_cust, "ssgsea")
+}
+#Heatmap(mat, row_names_side = "left", row_order = c(1:nrow(mat)), width = unit(1, "cm"), height = unit(8, "cm"), row_names_gp = gpar(fontsize = 8), name = "NES", show_column_names=FALSE)
+```
+
+```{r, echo = F}
+makeVolcPlotSc(res, "all CD4")
+datatable(res %>% filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% arrange(-avg_log2FC), class = "cell-border stripe compact", rownames = FALSE, caption = "single cell, sample level")
+```
+
+#### major cell type level
+```{r, include = F}
+resList = vector(mode = "list", length = length(unique(allSampsIP@meta.data$major_type)))
+names(resList) = unique(allSampsIP@meta.data$major_type)
+
+for(i in 1:length(unique(allSampsIP@meta.data$major_type)))
+{
+        cellType = names(resList)[i]
+        obj = subset(allSampsIP, subset = major_type == cellType)
+        res = FindMarkers(obj, ident.1 = "DR", ident.2 = "NDR", logfc.threshold = 0, min.pct = 0.1)
+        res$gene = rownames(res)
+        resList[[i]] = res
+}
+
+gsea_results_df_sum_H = gsea_cell_H(resList, metaMaj)
+gsea_results_df_sum_kegg = gsea_cell_kegg(resList, metaMaj)
+gsea_results_df_sum_cust = gsea_cell_cust(resList, ssgsea_markers, metaMaj)
+#mat = data.frame(path = unique(gsea_results_df_sum$ID))
+#cellTypes = unique(gsea_results_df_sum$cell_type)
+#for(i in 1:length(cellTypes))
+#{
+#        cellType = cellTypes[i]
+#        dfSub = gsea_results_df_sum %>% filter(cell_type == cellType)
+#        dfTmp = data.frame(path = dfSub$ID)
+#        dfTmp[cellType] = dfSub$NES
+#        mat = plyr::join(mat, dfTmp, by = "path")
+#}
+#matTmp = as.matrix(mat[,2:ncol(mat)])
+#rownames(matTmp) = mat$ID
+#mat = matTmp
+```
+
+```{r, echo = F, fig.height = 12, fig.width = 8}
+dotplot_cont_cell(gsea_results_df_sum_H, "Hallmark")
+dotplot_cont_cell(gsea_results_df_sum_kegg, "Kegg")
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) > 1)
+{
+        dotplot_cont_cell(gsea_results_df_sum_cust, "ssgsea")
+}
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) == 1)
+{
+        dotplot_fixed_cell(gsea_results_df_sum_cust, "ssgsea")
+}
+#Heatmap(mat, row_names_side = "left", row_order = rownames(mat), column_order = c(1:ncol(mat)), width = unit(1*ncol(mat), "cm"), height = unit(8, "cm"), row_names_gp = gpar(fontsize = 8), name = "NES")
+```
+
+```{r, echo = F, results = "asis"}
+for(i in 1:length(resList))
+{
+	df = resList[[i]]
+	cellType = names(resList[i])
+	
+	makeVolcPlotSc(df, cellType)
+	print(htmltools::tagList(datatable(df %>% filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% arrange(-avg_log2FC), class = "cell-border stripe compact", rownames = FALSE, caption = paste0("single cell, major cell type level ", cellType))))	
+}
+
+```
+
+
+#### cell subtype level
+```{r, include = F}
+resList = vector(mode = "list", length = length(unique(allSampsIP@meta.data$subtype)))
+names(resList) = unique(allSampsIP@meta.data$subtype)
+
+for(i in 1:length(unique(allSampsIP@meta.data$subtype)))
+{
+        cellType = names(resList)[i]
+        obj = subset(allSampsIP, subset = subtype == cellType)
+        res = FindMarkers(obj, ident.1 = "DR", ident.2 = "NDR", logfc.threshold = 0, min.pct = 0.1)
+        res$gene = rownames(res)
+        resList[[i]] = res
+}
+
+gsea_results_df_sum_H = gsea_cell_H(resList, metaSub)
+gsea_results_df_sum_kegg = gsea_cell_kegg(resList, metaSub)
+gsea_results_df_sum_cust = gsea_cell_cust(resList, ssgsea_markers, metaSub)
+```
+
+```{r, echo = F, fig.height = 12, fig.width = 8}
+dotplot_cont_cell(gsea_results_df_sum_H, "Hallmark")
+dotplot_cont_cell(gsea_results_df_sum_kegg, "Kegg")
+
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) > 1)
+{
+        dotplot_cont_cell(gsea_results_df_sum_cust, "ssgsea")
+}
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) == 1)
+{
+        dotplot_fixed_cell(gsea_results_df_sum_cust, "ssgsea")
+}
+```
+
+```{r, echo = F, results = "asis"}
+for(i in 1:length(resList))
+{
+	df = resList[[i]]
+	cellType = names(resList[i])
+	
+	makeVolcPlotSc(df, cellType)
+	print(htmltools::tagList(datatable(df %>% filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% arrange(-avg_log2FC), class = "cell-border stripe compact", rownames = FALSE, caption = paste0("single cell, cell subtype level ", cellType))))
+
+}
+
+```
+
+### {-}
+
+### Pseudobulk {.tabset}
+
+#### sample level
+```{r, include = F}
+counts = LayerData(object = allSampsIP, layer = "counts")
+metadata = allSampsIP@meta.data
+
+sce = SingleCellExperiment(assays = list(counts = counts), colData = metadata)
+sce = sce[rowSums(counts(sce) > 1) >= 10,]
+
+groups = data.frame(group_id = sce$orig.ident, barcode = sce$barcode)
+
+gene_by_celltype_sample_matrix <- t(counts(sce))
+
+m2 <- match(rownames(gene_by_celltype_sample_matrix), groups$barcode)
+
+rownames(gene_by_celltype_sample_matrix) <- groups$group_id[m2]
+
+pb <- t(sapply(by(gene_by_celltype_sample_matrix,rownames(gene_by_celltype_sample_matrix),colSums),identity))
+
+pb2 = t(pb)
+
+des = unique(metadata[c("orig.ident", "remission9m", "type")])
+rownames(des) = NULL
+
+pb2 = pb2[,which(colnames(pb2) %in% des$orig.ident)]
+
+cts = pb2
+dds = DESeqDataSetFromMatrix(countData = cts, colData = des, design = ~ remission9m)
+dds = estimateSizeFactors(dds)
+dds = DESeq(dds)
+res = results(dds, contrast = c("remission9m", "DR", "NDR"))
+res = res[order(res$padj),]
+cts = as.data.frame(t(counts(dds, normalized = TRUE)))
+
+res$gene = rownames(res)
+res = as.data.frame(res)
+res = res %>% filter(log2FoldChange != "NA")
+
+gseaDf = data.frame()
+
+m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>%
+          dplyr::select(gs_name, entrez_gene)
+gene.converter = bitr(res$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+df = res
+
+df <- df %>%
+  left_join(gene.converter, by=c("gene"="SYMBOL")) %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::arrange(desc(log2FoldChange))
+
+geneList.gsea <- as.numeric(df[,"log2FoldChange"])
+names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+
+mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+
+gseaDf <- mygsea@result %>%
+          mutate(Sig = -1*log10(qvalue)) %>%
+          arrange(NES)
+
+
+gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+  dplyr::select(ID, NES, p.adjust) %>%
+  mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+gsea_results_df_sum$significance = "significance"
+```
+
+```{r, echo = F}
+print(ggplot(gsea_results_df_sum, aes(x = significance, y=ID, color = Regulation, size = p.adjust_str)) +
+  geom_point() +
+  scale_color_manual(values = c("Up in DR" = "blue", "Up in NDR" = "red")) + theme_classic() +
+  scale_size_manual(values = c(3,2,1,0.5)) + theme(axis.text.x = element_text(angle = 45, hjust=1)) + ylab("Hallmark Pathway") +
+  theme(axis.text.y = element_text(size = 6)) + xlab(NULL) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.title.x = element_blank()) +
+  guides(size = guide_legend(title = "Significance")))
+
+makeVolcPlot(res, "all cells")
+datatable(res %>% filter(abs(log2FoldChange) > 1, padj < 0.05) %>% arrange(-log2FoldChange), class = "cell-border stripe compact", rownames = FALSE, caption = "Pseudobulk, sample level")
+```
+
+#### major cell type level
+```{r, include = F}
+#counts = LayerData(object = allSampsIP, layer = "counts")
+#metadata = allSampsIP@meta.data
+
+#sce = SingleCellExperiment(assays = list(counts = counts), colData = metadata)
+#sce = sce[rowSums(counts(sce) > 1) >= 10,]
+
+groups <- colData(sce)[, c("major_type", "orig.ident")] %>%
+  as.data.frame() %>%
+  mutate(group_id = paste0(major_type, "-", orig.ident)) %>%
+  rownames_to_column(var = 'barcode')
+
+gene_by_celltype_sample_matrix <- t(counts(sce))
+
+m2 <- match(rownames(gene_by_celltype_sample_matrix), groups$barcode)
+
+rownames(gene_by_celltype_sample_matrix) <- groups$group_id[m2]
+
+pb <- t(sapply(by(gene_by_celltype_sample_matrix,rownames(gene_by_celltype_sample_matrix),colSums),identity))
+
+splitf <- sapply(stringr::str_split(rownames(pb),
+                                    pattern = "-",
+                                    n = 2),  `[`, 1)
+
+pb2 <- split.data.frame(pb,
+                        factor(splitf)) %>%
+  lapply(function(u) set_colnames(t(u),
+                                  stringr::str_extract(rownames(u), "(?<=-).+")))
+
+
+des = unique(metadata[c("orig.ident", "remission9m", "type")])
+rownames(des) = NULL
+
+
+pb2 = lapply(pb2, function(x) x[,which(colnames(x) %in% des$orig.ident)])
+
+######### run DESeq2 for DE
+res_list = list()
+cts_list = list()
+for(i in 1:length(pb2))
+{
+	cts = pb2[[i]]
+	celltype = names(pb2)[i]
+	dds = DESeqDataSetFromMatrix(countData = cts, colData = des, design = ~ remission9m)
+	dds = estimateSizeFactors(dds)
+	dds = DESeq(dds)
+	res = results(dds, contrast = c("remission9m", "DR", "NDR"))
+	res = res[order(res$padj),]
+	cts_list[[i]] = as.data.frame(t(counts(dds, normalized = TRUE)))
+	res$gene = rownames(res)
+	res = as.data.frame(res)
+	res = res %>% filter(log2FoldChange != "NA") 
+	res_list[[i]] = res
+}
+names(res_list) = names(pb2)
+names(cts_list) = names(pb2)
+
+
+gseaDf = data.frame()
+
+for(i in 1:length(res_list))
+{
+	cell_type = names(res_list)[i]
+	df = res_list[[i]]
+	m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>%
+		  dplyr::select(gs_name, entrez_gene)
+	gene.converter = bitr(df$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+
+	df <- df %>%
+	  left_join(gene.converter, by=c("gene"="SYMBOL")) %>%
+	  dplyr::filter(!is.na(ENTREZID)) %>%
+	  dplyr::arrange(desc(log2FoldChange))
+
+	geneList.gsea <- as.numeric(df[,"log2FoldChange"])
+	names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+
+	mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+
+	GSEA.result.df <- mygsea@result %>%
+          mutate(Sig = -1*log10(qvalue)) %>%
+          arrange(NES)
+
+        GSEA.result.df$cell_type = cell_type
+        gseaDf = rbind(gseaDf, GSEA.result.df)
+}
+
+gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+  dplyr::select(ID, NES, p.adjust, cell_type) %>%
+  mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+```
+
+```{r, echo = F, results = "asis"}
+ggplot(gsea_results_df_sum, aes(x = cell_type, y=ID, color = Regulation, size = p.adjust_str)) +
+  geom_point() +
+  scale_color_manual(values = c("Up in DR" = "blue", "Up in NDR" = "red")) + theme_classic() +
+  scale_size_manual(values = c(3,2,1,0.5)) + theme(axis.text.x = element_text(angle = 45, hjust=1)) + ylab("Hallmark Pathway") +
+  theme(axis.text.y = element_text(size = 6)) + xlab(NULL) +
+  guides(size = guide_legend(title = "Significance"))
+
+for(i in 1:length(res_list))
+{
+	cellType = names(res_list)[i]
+	makeVolcPlot(res_list[[i]], cellType)
+        print(htmltools::tagList(datatable(res_list[[i]] %>% filter(abs(log2FoldChange) > 1, padj < 0.05) %>% arrange(-log2FoldChange), class = "cell-border stripe compact", rownames = FALSE, caption = paste0("Pseudobulk, major cell type ", cellType))))
+}
+
+```
+
+#### cell subtype level
+```{r, include = F}
+#counts = LayerData(object = allSampsIP, layer = "counts")
+#metadata = allSampsIP@meta.data
+
+#sce = SingleCellExperiment(assays = list(counts = counts), colData = metadata)
+#sce = sce[rowSums(counts(sce) > 1) >= 10,]
+
+groups <- colData(sce)[, c("subtype", "orig.ident")] %>%
+  as.data.frame() %>%
+  mutate(group_id = paste0(subtype, "-", orig.ident)) %>%
+  rownames_to_column(var = 'barcode')
+
+gene_by_celltype_sample_matrix <- t(counts(sce))
+
+m2 <- match(rownames(gene_by_celltype_sample_matrix), groups$barcode)
+
+rownames(gene_by_celltype_sample_matrix) <- groups$group_id[m2]
+
+pb <- t(sapply(by(gene_by_celltype_sample_matrix,rownames(gene_by_celltype_sample_matrix),colSums),identity))
+
+splitf <- sapply(stringr::str_split(rownames(pb),
+                                    pattern = "-",
+                                    n = 2),  `[`, 1)
+
+pb2 <- split.data.frame(pb,
+                        factor(splitf)) %>%
+  lapply(function(u) set_colnames(t(u),
+                                  stringr::str_extract(rownames(u), "(?<=-).+")))
+
+
+des = unique(metadata[c("orig.ident", "remission9m", "type")])
+rownames(des) = NULL
+
+
+pb2 = lapply(pb2, function(x) x[,which(colnames(x) %in% des$orig.ident)])
+
+######### run DESeq2 for DE
+res_list = list()
+cts_list = list()
+for(i in 1:length(pb2))
+{
+	cts = pb2[[i]]
+	celltype = names(pb2)[i]
+	dds = DESeqDataSetFromMatrix(countData = cts, colData = des[which(des$orig.ident %in% colnames(cts)),], design = ~ remission9m)
+	dds = estimateSizeFactors(dds)
+	dds = DESeq(dds)
+	res = results(dds, contrast = c("remission9m", "DR", "NDR"))
+	res = res[order(res$padj),]
+	cts_list[[i]] = as.data.frame(t(counts(dds, normalized = TRUE)))
+	res$gene = rownames(res)
+	res = as.data.frame(res)
+	res = res %>% filter(log2FoldChange != "NA") 
+	res_list[[i]] = res
+}
+names(res_list) = names(pb2)
+names(cts_list) = names(pb2)
+
+gseaDf = data.frame()
+
+for(i in 1:length(res_list))
+{
+	cell_type = names(res_list)[i]
+	df = res_list[[i]]
+	m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>%
+		  dplyr::select(gs_name, entrez_gene)
+	gene.converter = bitr(df$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+
+	df <- df %>%
+	  left_join(gene.converter, by=c("gene"="SYMBOL")) %>%
+	  dplyr::filter(!is.na(ENTREZID)) %>%
+	  dplyr::arrange(desc(log2FoldChange))
+
+	geneList.gsea <- as.numeric(df[,"log2FoldChange"])
+	names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+
+	mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+
+	GSEA.result.df <- mygsea@result %>%
+          mutate(Sig = -1*log10(qvalue)) %>%
+          arrange(NES)
+
+        GSEA.result.df$cell_type = cell_type
+        gseaDf = rbind(gseaDf, GSEA.result.df)
+}
+
+gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+  dplyr::select(ID, NES, p.adjust, cell_type) %>%
+  mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+```
+
+```{r, echo = F, results = "asis"}
+ggplot(gsea_results_df_sum, aes(x = cell_type, y=ID, color = Regulation, size = p.adjust_str)) +
+  geom_point() +
+  scale_color_manual(values = c("Up in DR" = "blue", "Up in NDR" = "red")) + theme_classic() +
+  scale_size_manual(values = c(3,2,1,0.5)) + theme(axis.text.x = element_text(angle = 45, hjust=1)) + ylab("Hallmark Pathway") +
+  theme(axis.text.y = element_text(size = 6)) + xlab(NULL) +
+  guides(size = guide_legend(title = "Significance"))
+
+for(i in 1:length(res_list))
+{
+	cellType = names(res_list)[i]
+	makeVolcPlot(res_list[[i]], cellType)
+        print(htmltools::tagList(datatable(res_list[[i]] %>% filter(abs(log2FoldChange) > 1, padj < 0.05) %>% arrange(-log2FoldChange), class = "cell-border stripe compact", rownames = FALSE, caption = paste0("Pseudobulk, cell subtype level ", cellType))))
+}
+
+```
+
+### {-}
+
+## {-}
+
+
+
+## CAR+ cells {.tabset}
+
+### single cell {.tabset}
+
+#### sample level
+```{r car pos sc, include = F}
+Idents(allSampsFilt) = "remission9m"
+allSampsIP = subset(allSampsFilt, subset = type == "IP" & carPos == "pos" & remission9m != "insufficientFU")
+
+meta = allSampsIP@meta.data
+metaMaj = meta %>% group_by(major_type) %>% mutate(nCell = n())
+metaMaj = as.data.frame(unique(metaMaj[c("major_type", "nCell")]))
+colnames(metaMaj)[1] = "cell_type"
+
+metaSub = meta %>% group_by(subtype) %>% mutate(nCell = n())
+metaSub = as.data.frame(unique(metaSub[c("subtype", "nCell")]))
+colnames(metaSub)[1] = "cell_type"
+
+res = FindMarkers(allSampsIP, ident.1 = "DR", ident.2 = "NDR", logfc.threshold = 0, min.pct = 0.1)
+res$gene = rownames(res)
+
+gsea_results_df_sum_H = gsea_sample_H(res)
+gsea_results_df_sum_kegg = gsea_sample_kegg(res)
+gsea_results_df_sum_cust = gsea_sample_cust(res, ssgsea_markers)
+```
+
+```{r, echo = F, fig.height = 12, fig.width = 8}
+dotplot_cont_samp(gsea_results_df_sum_H, "Hallmark")
+dotplot_cont_samp(gsea_results_df_sum_kegg, "Kegg")
+
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) > 1)
+{
+        dotplot_cont_samp(gsea_results_df_sum_cust, "ssgsea")
+}
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) == 1)
+{
+        dotplot_fixed_samp(gsea_results_df_sum_cust, "ssgsea")
+}
+```
+
+```{r, echo = F}
+makeVolcPlotSc(res, "all CD4 CAR+")
+datatable(res %>% filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% arrange(-avg_log2FC), class = "cell-border stripe compact", rownames = FALSE, caption = "CAR+ single cell, sample level")
+```
+
+#### major cell type level
+```{r, include = F}
+resList = vector(mode = "list", length = length(unique(allSampsIP@meta.data$major_type)))
+names(resList) = unique(allSampsIP@meta.data$major_type)
+
+for(i in 1:length(unique(allSampsIP@meta.data$major_type)))
+{
+        cellType = names(resList)[i]
+        obj = subset(allSampsIP, subset = major_type == cellType)
+        res = FindMarkers(obj, ident.1 = "DR", ident.2 = "NDR", logfc.threshold = 0, min.pct = 0.1)
+        res$gene = rownames(res)
+        resList[[i]] = res
+}
+
+gsea_results_df_sum_H = gsea_cell_H(resList, metaMaj)
+gsea_results_df_sum_kegg = gsea_cell_kegg(resList, metaMaj)
+gsea_results_df_sum_cust = gsea_cell_cust(resList, ssgsea_markers, metaMaj)
+```
+
+```{r, echo = F, fig.height = 12, fig.width = 8}
+dotplot_cont_cell(gsea_results_df_sum_H, "Hallmark")
+dotplot_cont_cell(gsea_results_df_sum_kegg, "Kegg")
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) > 1)
+{
+        dotplot_cont_cell(gsea_results_df_sum_cust, "ssgsea")
+}
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) == 1)
+{
+        dotplot_fixed_cell(gsea_results_df_sum_cust, "ssgsea")
+}
+```
+
+```{r, echo = F, results = "asis"}
+for(i in 1:length(resList))
+{
+	df = resList[[i]]
+	cellType = names(resList[i])
+        
+	makeVolcPlotSc(df, cellType)
+	print(htmltools::tagList(datatable(df %>% filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% arrange(-avg_log2FC), class = "cell-border stripe compact", rownames = FALSE, caption = paste0("CAR+ single cell, major cell type level ", cellType))))
+}
+
+```
+
+
+#### cell subtype level
+```{r, include = F}
+resList = vector(mode = "list", length = length(unique(allSampsIP@meta.data$subtype)))
+names(resList) = unique(allSampsIP@meta.data$subtype)
+
+for(i in 1:length(unique(allSampsIP@meta.data$subtype)))
+{
+        cellType = names(resList)[i]
+        obj = subset(allSampsIP, subset = subtype == cellType)
+        res = FindMarkers(obj, ident.1 = "DR", ident.2 = "NDR", logfc.threshold = 0, min.pct = 0.1)
+        res$gene = rownames(res)
+        resList[[i]] = res
+}
+
+gsea_results_df_sum_H = gsea_cell_H(resList, metaSub)
+gsea_results_df_sum_kegg = gsea_cell_kegg(resList, metaSub)
+gsea_results_df_sum_cust = gsea_cell_cust(resList, ssgsea_markers, metaSub)
+```
+
+```{r, echo = F, fig.height = 12, fig.width = 8}
+dotplot_cont_cell(gsea_results_df_sum_H, "Hallmark")
+dotplot_cont_cell(gsea_results_df_sum_kegg, "Kegg")
+
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) > 1)
+{
+        dotplot_cont_cell(gsea_results_df_sum_cust, "ssgsea")
+}
+
+if(length(unique(gsea_results_df_sum_cust$Regulation)) == 1)
+{
+        dotplot_fixed_cell(gsea_results_df_sum_cust, "ssgsea")
+}
+```
+
+```{r, echo = F, results = "asis"}
+for(i in 1:length(resList))
+{
+	df = resList[[i]]
+	cellType = names(resList[i])
+        
+	makeVolcPlotSc(df, cellType)
+	print(htmltools::tagList(datatable(df %>% filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% arrange(-avg_log2FC), class = "cell-border stripe compact", rownames = FALSE, caption = paste0("CAR+ single cell, cell subtype level", cellType))))
+}
+
+```
+
+### {-}
+
+### Pseudobulk {.tabset}
+
+#### sample level
+```{r, include = F}
+counts = LayerData(object = allSampsIP, layer = "counts")
+metadata = allSampsIP@meta.data
+
+sce = SingleCellExperiment(assays = list(counts = counts), colData = metadata)
+sce = sce[rowSums(counts(sce) > 1) >= 10,]
+
+groups = data.frame(group_id = sce$orig.ident, barcode = sce$barcode)
+
+gene_by_celltype_sample_matrix <- t(counts(sce))
+
+m2 <- match(rownames(gene_by_celltype_sample_matrix), groups$barcode)
+
+rownames(gene_by_celltype_sample_matrix) <- groups$group_id[m2]
+
+pb <- t(sapply(by(gene_by_celltype_sample_matrix,rownames(gene_by_celltype_sample_matrix),colSums),identity))
+
+pb2 = t(pb)
+
+des = unique(metadata[c("orig.ident", "remission9m", "type")])
+rownames(des) = NULL
+
+pb2 = pb2[,which(colnames(pb2) %in% des$orig.ident)]
+
+cts = pb2
+dds = DESeqDataSetFromMatrix(countData = cts, colData = des, design = ~ remission9m)
+dds = estimateSizeFactors(dds)
+dds = DESeq(dds)
+res = results(dds, contrast = c("remission9m", "DR", "NDR"))
+res = res[order(res$padj),]
+
+res$gene = rownames(res)
+res = as.data.frame(res)
+res = res %>% filter(log2FoldChange != "NA")
+
+gseaDf = data.frame()
+
+m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>%
+          dplyr::select(gs_name, entrez_gene)
+gene.converter = bitr(res$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+df = res
+
+df <- df %>%
+  left_join(gene.converter, by=c("gene"="SYMBOL")) %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::arrange(desc(log2FoldChange))
+
+geneList.gsea <- as.numeric(df[,"log2FoldChange"])
+names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+
+mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+
+gseaDf <- mygsea@result %>%
+          mutate(Sig = -1*log10(qvalue)) %>%
+          arrange(NES)
+
+
+gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+  dplyr::select(ID, NES, p.adjust) %>%
+  mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+gsea_results_df_sum$significance = "significance"
+```
+
+```{r, echo = F}
+print(ggplot(gsea_results_df_sum, aes(x = significance, y=ID, color = Regulation, size = p.adjust_str)) +
+  geom_point() +
+  scale_color_manual(values = c("Up in DR" = "blue", "Up in NDR" = "red")) + theme_classic() +
+  scale_size_manual(values = c(3,2,1,0.5)) + theme(axis.text.x = element_text(angle = 45, hjust=1)) + ylab("Hallmark Pathway") +
+  theme(axis.text.y = element_text(size = 6)) + xlab(NULL) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.title.x = element_blank()) +
+  guides(size = guide_legend(title = "Significance")))
+
+makeVolcPlot(res, "all cells")
+datatable(res %>% filter(abs(log2FoldChange) > 1, padj < 0.05) %>% arrange(-log2FoldChange), class = "cell-border stripe compact", rownames = FALSE, caption = "CAR+ pseudobulk, sample level")
+```
+
+#### major cell type level
+```{r, include = F}
+#counts = LayerData(object = allSampsIP, layer = "counts")
+#metadata = allSampsIP@meta.data
+
+#sce = SingleCellExperiment(assays = list(counts = counts), colData = metadata)
+#sce = sce[rowSums(counts(sce) > 1) >= 10,]
+
+groups <- colData(sce)[, c("major_type", "orig.ident")] %>%
+  as.data.frame() %>%
+  mutate(group_id = paste0(major_type, "-", orig.ident)) %>%
+  rownames_to_column(var = 'barcode')
+
+gene_by_celltype_sample_matrix <- t(counts(sce))
+
+m2 <- match(rownames(gene_by_celltype_sample_matrix), groups$barcode)
+
+rownames(gene_by_celltype_sample_matrix) <- groups$group_id[m2]
+
+pb <- t(sapply(by(gene_by_celltype_sample_matrix,rownames(gene_by_celltype_sample_matrix),colSums),identity))
+
+splitf <- sapply(stringr::str_split(rownames(pb),
+                                    pattern = "-",
+                                    n = 2),  `[`, 1)
+
+pb2 <- split.data.frame(pb,
+                        factor(splitf)) %>%
+  lapply(function(u) set_colnames(t(u),
+                                  stringr::str_extract(rownames(u), "(?<=-).+")))
+
+
+des = unique(metadata[c("orig.ident", "remission9m", "type")])
+rownames(des) = NULL
+
+
+pb2 = lapply(pb2, function(x) x[,which(colnames(x) %in% des$orig.ident)])
+
+######### run DESeq2 for DE
+res_list = list()
+cts_list = list()
+for(i in 1:length(pb2))
+{
+	cts = pb2[[i]]
+	celltype = names(pb2)[i]
+	dds = DESeqDataSetFromMatrix(countData = cts, colData = des, design = ~ remission9m)
+	dds = estimateSizeFactors(dds)
+	dds = DESeq(dds)
+	res = results(dds, contrast = c("remission9m", "DR", "NDR"))
+	res = res[order(res$padj),]
+	cts_list[[i]] = as.data.frame(t(counts(dds, normalized = TRUE)))
+	res$gene = rownames(res)
+	res = as.data.frame(res)
+	res = res %>% filter(log2FoldChange != "NA") 
+	res_list[[i]] = res
+}
+names(res_list) = names(pb2)
+names(cts_list) = names(pb2)
+
+
+gseaDf = data.frame()
+
+for(i in 1:length(res_list))
+{
+	cell_type = names(res_list)[i]
+	df = res_list[[i]]
+	m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>%
+		  dplyr::select(gs_name, entrez_gene)
+	gene.converter = bitr(df$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+
+	df <- df %>%
+	  left_join(gene.converter, by=c("gene"="SYMBOL")) %>%
+	  dplyr::filter(!is.na(ENTREZID)) %>%
+	  dplyr::arrange(desc(log2FoldChange))
+
+	geneList.gsea <- as.numeric(df[,"log2FoldChange"])
+	names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+
+	mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+
+	GSEA.result.df <- mygsea@result %>%
+          mutate(Sig = -1*log10(qvalue)) %>%
+          arrange(NES)
+
+        GSEA.result.df$cell_type = cell_type
+        gseaDf = rbind(gseaDf, GSEA.result.df)
+}
+
+gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+  dplyr::select(ID, NES, p.adjust, cell_type) %>%
+  mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+```
+
+```{r, echo = F, results = "asis"}
+ggplot(gsea_results_df_sum, aes(x = cell_type, y=ID, color = Regulation, size = p.adjust_str)) +
+  geom_point() +
+  scale_color_manual(values = c("Up in DR" = "blue", "Up in NDR" = "red")) + theme_classic() +
+  scale_size_manual(values = c(3,2,1,0.5)) + theme(axis.text.x = element_text(angle = 45, hjust=1)) + ylab("Hallmark Pathway") +
+  theme(axis.text.y = element_text(size = 6)) + xlab(NULL) +
+  guides(size = guide_legend(title = "Significance"))
+
+for(i in 1:length(res_list))
+{
+	cellType = names(res_list)[i]
+	makeVolcPlot(res_list[[i]], cellType)
+        print(htmltools::tagList(datatable(res_list[[i]] %>% filter(abs(log2FoldChange) > 1, padj < 0.05) %>% arrange(-log2FoldChange), class = "cell-border stripe compact", rownames = FALSE, caption = paste0("CAR+ pseudobulk, major cell type level ", cellType))))
+}
+
+```
+
+#### cell subtype level
+```{r ps carpos subtype, include = F}
+#counts = LayerData(object = allSampsIP, layer = "counts")
+#metadata = allSampsIP@meta.data
+
+#sce = SingleCellExperiment(assays = list(counts = counts), colData = metadata)
+#sce = sce[rowSums(counts(sce) > 1) >= 10,]
+
+groups <- colData(sce)[, c("subtype", "orig.ident")] %>%
+  as.data.frame() %>%
+  mutate(group_id = paste0(subtype, "-", orig.ident)) %>%
+  rownames_to_column(var = 'barcode')
+
+gene_by_celltype_sample_matrix <- t(counts(sce))
+
+m2 <- match(rownames(gene_by_celltype_sample_matrix), groups$barcode)
+
+rownames(gene_by_celltype_sample_matrix) <- groups$group_id[m2]
+
+pb <- t(sapply(by(gene_by_celltype_sample_matrix,rownames(gene_by_celltype_sample_matrix),colSums),identity))
+
+splitf <- sapply(stringr::str_split(rownames(pb),
+                                    pattern = "-",
+                                    n = 2),  `[`, 1)
+
+pb2 <- split.data.frame(pb,
+                        factor(splitf)) %>%
+  lapply(function(u) set_colnames(t(u),
+                                  stringr::str_extract(rownames(u), "(?<=-).+")))
+
+
+des = unique(metadata[c("orig.ident", "remission9m", "type")])
+rownames(des) = NULL
+
+
+pb2 = lapply(pb2, function(x) x[,which(colnames(x) %in% des$orig.ident)])
+
+
+######### run DESeq2 for DE
+res_list = list()
+cts_list = list()
+for(i in 1:length(pb2))
+{
+	cts = pb2[[i]]
+	celltype = names(pb2)[i]
+	print(i)
+	dds = DESeqDataSetFromMatrix(countData = cts, colData = des[which(des$orig.ident %in% colnames(cts)),], design = ~ remission9m)
+	dds = estimateSizeFactors(dds)
+	dds = DESeq(dds)
+	res = results(dds, contrast = c("remission9m", "DR", "NDR"))
+	res = res[order(res$padj),]
+	cts_list[[i]] = as.data.frame(t(counts(dds, normalized = TRUE)))
+	res$gene = rownames(res)
+	res = as.data.frame(res)
+	res = res %>% filter(log2FoldChange != "NA") 
+	res_list[[i]] = res
+}
+names(res_list) = names(pb2)
+names(cts_list) = names(pb2)
+
+
+gseaDf = data.frame()
+
+for(i in 1:length(res_list))
+{
+	cell_type = names(res_list)[i]
+	print(cell_type)
+	df = res_list[[i]]
+	m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>%
+		  dplyr::select(gs_name, entrez_gene)
+	gene.converter = bitr(df$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+
+	df <- df %>%
+	  left_join(gene.converter, by=c("gene"="SYMBOL")) %>%
+	  dplyr::filter(!is.na(ENTREZID)) %>%
+	  dplyr::arrange(desc(log2FoldChange))
+
+	geneList.gsea <- as.numeric(df[,"log2FoldChange"])
+	names(geneList.gsea) <- as.character(df[,"ENTREZID"])
+
+
+	mygsea <- GSEA(geneList.gsea, TERM2GENE = m_t2g, pvalueCutoff = 0.25, pAdjustMethod = "BH")
+	if(nrow(mygsea) > 1)
+	{
+		GSEA.result.df <- mygsea@result %>%
+		  mutate(Sig = -1*log10(qvalue)) %>%
+		  arrange(NES)
+
+		GSEA.result.df$cell_type = cell_type
+		gseaDf = rbind(gseaDf, GSEA.result.df)
+	}
+}
+
+gsea_results_df_sum = gseaDf %>% filter(p.adjust <= 0.25) %>%
+  dplyr::select(ID, NES, p.adjust, cell_type) %>%
+  mutate(Regulation = if_else(NES>0, "Up in DR", "Up in NDR"))
+
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust < 0.01] = "< 0.01"
+gsea_results_df_sum$p.adjust_str[gsea_results_df_sum$p.adjust > 0.01 & gsea_results_df_sum$p.adjust < 0.05] = "0.01-0.05"
+gsea_results_df_sum = gsea_results_df_sum %>% filter(!is.na(p.adjust_str))
+
+gsea_results_df_sum$Regulation <- factor(gsea_results_df_sum$Regulation, levels = c("Up in DR", "Up in NDR"))
+```
+
+```{r, echo = F, results = "asis"}
+ggplot(gsea_results_df_sum, aes(x = cell_type, y=ID, color = Regulation, size = p.adjust_str)) +
+  geom_point() +
+  scale_color_manual(values = c("Up in DR" = "blue", "Up in NDR" = "red")) + theme_classic() +
+  scale_size_manual(values = c(3,2,1,0.5)) + theme(axis.text.x = element_text(angle = 45, hjust=1)) + ylab("Hallmark Pathway") +
+  theme(axis.text.y = element_text(size = 6)) + xlab(NULL) +
+  guides(size = guide_legend(title = "Significance"))
+
+for(i in 1:length(res_list))
+{
+	cellType = names(res_list)[i]
+	makeVolcPlot(res_list[[i]], cellType)
+        print(htmltools::tagList(datatable(res_list[[i]] %>% filter(abs(log2FoldChange) > 1, padj < 0.05) %>% arrange(-log2FoldChange), class = "cell-border stripe compact", rownames = FALSE, caption = paste0("CAR+ pseudobulk, cell subtype level ", cellType))))
+}
+
+```
+### {-}
+
+## {-}
+
+# {-}
