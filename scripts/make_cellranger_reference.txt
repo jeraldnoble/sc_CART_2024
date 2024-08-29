@@ -1,0 +1,45 @@
+### add referernce sequences from abecma and carvykti to hg38 reference
+
+### get some samples for each product
+cat CAR-545-PBMC/*R2_*.fastq.gz > /share/lab_robinson/jd/resources/hg38_abecma/six_samps.fq.gz #cilta-cel
+cat CAR-440-PBMC/*R2_*.fastq.gz >> /share/lab_robinson/jd/resources/hg38_abecma/six_samps.fq.gz #cilta-cel 
+cat CAR-439-PBMC/*R2_*.fastq.gz >> /share/lab_robinson/jd/resources/hg38_abecma/six_samps.fq.gz #cilta-cel
+cat CAR-352/*R2_*.fastq.gz >> /share/lab_robinson/jd/resources/hg38_abecma/six_samps.fq.gz #ide-cel
+cat CAR-448/*R2_*.fastq.gz >> /share/lab_robinson/jd/resources/hg38_abecma/six_samps.fq.gz #ide-cel
+cat CAR-512/*R2_*.fastq.gz >> /share/lab_robinson/jd/resources/hg38_abecma/six_samps.fq.gz #ide-cel
+
+### add gtf info to hg38 info
+cat gencode.v36.primary_assembly.annotation.gtf car_constructs.gtf > gencode.v36.primary_assembly_CAR.annotation.gtf
+
+### add CAR construct sequences to reference genome
+cat GRCh38.primary_assembly.genome.fa car_seqs.fa > GRCh38.primary_assembly_CAR.genome.fa
+samtools faidx GRCh38.primary_assembly_CAR.genome.fa
+
+### align samples to reference
+STAR --runMode genomeGenerate --genomeDir star_idx --runThreadN 10 --genomeFastaFiles GRCh38.primary_assembly_CAR.genome.fa \
+        --sjdbGTFfile gencode.v36.primary_assembly_CAR.annotation.gtf
+
+STAR --genomeDir star_idx --runThreadN 10 --readFilesIn six_samps.fq.gz --outSAMtype BAM SortedByCoordinate --readFilesCommand zcat
+samtools index Aligned.sortedByCoord.out.bam
+
+### call SNPs and filter
+samtools view -h Aligned.sortedByCoord.out.bam Abecma Carvykti | \
+	awk -F '\t' 'BEGIN{OFS=FS}{gsub("N","D",$6);print}' | \
+	bcftools mpileup -f GRCh38.primary_assembly_CAR.genome.fa /dev/stdin  | \
+	bcftools call -mv | \
+	bcftools filter -e 'IMF < .5' | \
+	bgzip > car_variants.vcf.gz
+tabix car_variants.vcf.gz
+
+### fix SNPs in CAR construct sequences
+cat GRCh38.primary_assembly_CAR.genome.fa | \
+	bcftools consensus --chain liftover.chain car_variants.vcf.gz > GRCh38.primary_assembly_CAR_updated.genome.fa
+samtools faidx GRCh38.primary_assembly_CAR_updated.genome.fa
+
+
+CrossMap.py gff liftover.chain gencode.v36.primary_assembly_CAR.annotation.gtf gencode.v36.primary_assembly_CAR_updated.annotation.gtf
+
+
+### make reference for cellranger
+cellranger mkref --genome=cellranger_ref \
+--fasta=GRCh38.primary_assembly_CAR_updated.genome.fa --genes gencode.v36.primary_assembly_CAR_updated.annotation.gtf --nthreads=10

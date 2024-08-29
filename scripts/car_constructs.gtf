@@ -1,0 +1,6 @@
+Abecma	CUSTOM	gene	1	1482	.	+	.	gene_id "Abecma"
+Abecma	CUSTOM	transcript	1	1482	.	+	.	gene_id "Abecma"; transcript_id "Abecma"
+Abecma	CUSTOM	exon	1	1482	.	+	.	gene_id "Abecma"; transcript_id "Abecma"; exon_id "Abecma"
+Carvykti	CUSTOM	gene	1	1461	.	+	.	gene_id "Carvykti"
+Carvykti	CUSTOM	transcript	1	1461	.	+	.	gene_id "Carvykti"; transcript_id "Carvykti"
+Carvykti	CUSTOM	exon	1	1461	.	+	.	gene_id "Carvykti"; transcript_id "Carvykti"; exon_id "Carvykti"
